@@ -19,6 +19,7 @@ import torch.nn as nn
 from monai.networks.blocks.patchembedding import PatchEmbeddingBlock
 from monai.networks.blocks.transformerblock import TransformerBlock
 
+
 __all__ = ["ViT"]
 
 
@@ -46,6 +47,8 @@ class ViT(nn.Module):
         spatial_dims: int = 3,
         post_activation="Tanh",
         qkv_bias: bool = False,
+        cross_attention_dim=32,
+        cross_attention_index=[12],
     ) -> None:
         """
         Args:
@@ -98,7 +101,17 @@ class ViT(nn.Module):
             spatial_dims=spatial_dims,
         )
         self.blocks = nn.ModuleList(
-            [TransformerBlock(hidden_size, mlp_dim, num_heads, dropout_rate, qkv_bias) for i in range(num_layers)]
+            [
+                TransformerBlock(
+                    hidden_size,
+                    mlp_dim,
+                    num_heads,
+                    dropout_rate,
+                    qkv_bias,
+                    cross_attention_dim=cross_attention_dim if i in cross_attention_index else None,
+                )
+                for i in range(num_layers)
+            ]
         )
         self.norm = nn.LayerNorm(hidden_size)
         if self.classification:
@@ -108,14 +121,14 @@ class ViT(nn.Module):
             else:
                 self.classification_head = nn.Linear(hidden_size, num_classes)  # type: ignore
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         x = self.patch_embedding(x)
         if hasattr(self, "cls_token"):
             cls_token = self.cls_token.expand(x.shape[0], -1, -1)
             x = torch.cat((cls_token, x), dim=1)
         hidden_states_out = []
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, context=context)
             hidden_states_out.append(x)
         x = self.norm(x)
         if hasattr(self, "classification_head"):

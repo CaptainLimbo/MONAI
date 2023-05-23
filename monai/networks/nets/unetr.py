@@ -14,11 +14,40 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch.nn as nn
-
+import torch
+import itertools
 from monai.networks.blocks.dynunet_block import UnetOutBlock
 from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock
 from monai.networks.nets.vit import ViT
 from monai.utils import ensure_tuple_rep
+
+
+def seq_rep_converter(rep, num_split=8, add_const=True):
+    # rep: (batch_size, 1, shape_rep_dim)
+    random_index = []
+    index_base = rep.size(-1) // num_split
+    combs = itertools.combinations(range(num_split), 2)
+    for comb in combs:
+        indices = list(range(index_base * comb[0], index_base * (comb[0] + 1))) + list(
+            range(index_base * comb[1], index_base * (comb[1] + 1))
+        )
+        random_index.append(indices)
+    '''
+    for i in range(32):
+        indice = np.random.choice(
+            attention_embedding_dim, attention_embedding_dim // 4, replace=False
+        )
+        random_index.append(indice)
+    '''
+    new_rep = torch.concat(
+        [rep[:, :, rand_index] for rand_index in random_index],
+        dim=1,
+    )
+    if not add_const:
+        return new_rep
+    const = torch.ones((rep.size(0), 1, len(random_index[0]))).to(rep.device)
+    new_rep = torch.cat([new_rep, const], dim=1)
+    return new_rep
 
 
 class UNETR(nn.Module):
@@ -43,6 +72,9 @@ class UNETR(nn.Module):
         dropout_rate: float = 0.0,
         spatial_dims: int = 3,
         qkv_bias: bool = False,
+        cross_attention_dim=128,
+        cross_attention_index=[12],
+        predict_shape_rep=False,
     ) -> None:
         """
         Args:
@@ -101,6 +133,8 @@ class UNETR(nn.Module):
             dropout_rate=dropout_rate,
             spatial_dims=spatial_dims,
             qkv_bias=qkv_bias,
+            cross_attention_dim=cross_attention_dim // 8 * 2,
+            cross_attention_index=cross_attention_index,
         )
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
@@ -147,6 +181,15 @@ class UNETR(nn.Module):
             conv_block=conv_block,
             res_block=res_block,
         )
+        self.predict_shape_rep = predict_shape_rep
+        if self.predict_shape_rep:
+            self.shape_conv = nn.Sequential(
+                nn.Conv2d(8 * feature_size, 64, 3, 1, 1),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(64, 16, 3, 1, 1),
+            )
+            self.shape_fc = nn.Linear(16 * img_size[0] // 8 * img_size[1] // 8, cross_attention_dim)
+
         self.decoder5 = UnetrUpBlock(
             spatial_dims=spatial_dims,
             in_channels=hidden_size,
@@ -193,8 +236,10 @@ class UNETR(nn.Module):
         x = x.permute(self.proj_axes).contiguous()
         return x
 
-    def forward(self, x_in):
-        x, hidden_states_out = self.vit(x_in)
+    def forward(self, x_in, context=None):
+        if context is not None:
+            context = seq_rep_converter(context)
+        x, hidden_states_out = self.vit(x_in, context=context)
         enc1 = self.encoder1(x_in)
         x2 = hidden_states_out[3]
         enc2 = self.encoder2(self.proj_feat(x2))
@@ -202,9 +247,15 @@ class UNETR(nn.Module):
         enc3 = self.encoder3(self.proj_feat(x3))
         x4 = hidden_states_out[9]
         enc4 = self.encoder4(self.proj_feat(x4))
+        if self.predict_shape_rep:
+            shape_rep = self.shape_fc(self.shape_conv(enc4).view(x4.size(0), -1))
+            shape_rep = shape_rep.unsqueeze(1)
+        else:
+            shape_rep = None
         dec4 = self.proj_feat(x)
         dec3 = self.decoder5(dec4, enc4)
         dec2 = self.decoder4(dec3, enc3)
         dec1 = self.decoder3(dec2, enc2)
         out = self.decoder2(dec1, enc1)
-        return self.out(out)
+        out_dct = {'shape_rep': shape_rep, 'seg_map': self.out(out)}
+        return out_dct

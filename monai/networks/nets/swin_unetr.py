@@ -22,9 +22,15 @@ import torch.utils.checkpoint as checkpoint
 from torch.nn import LayerNorm
 
 from monai.networks.blocks import MLPBlock as Mlp
-from monai.networks.blocks import PatchEmbed, UnetOutBlock, UnetrBasicBlock, UnetrUpBlock
+from monai.networks.blocks import (
+    PatchEmbed,
+    UnetOutBlock,
+    UnetrBasicBlock,
+    UnetrUpBlock,
+)
 from monai.networks.layers import DropPath, trunc_normal_
 from monai.utils import ensure_tuple_rep, look_up_option, optional_import
+from monai.networks.blocks.transformerblock import TransformerBlock
 
 rearrange, _ = optional_import("einops", name="rearrange")
 
@@ -40,6 +46,34 @@ __all__ = [
     "BasicLayer",
     "SwinTransformer",
 ]
+
+
+def seq_rep_converter(rep, num_split=8, add_const=True):
+    # rep: (batch_size, 1, shape_rep_dim)
+    random_index = []
+    index_base = rep.size(-1) // num_split
+    combs = itertools.combinations(range(num_split), 2)
+    for comb in combs:
+        indices = list(range(index_base * comb[0], index_base * (comb[0] + 1))) + list(
+            range(index_base * comb[1], index_base * (comb[1] + 1))
+        )
+        random_index.append(indices)
+    """
+    for i in range(32):
+        indice = np.random.choice(
+            attention_embedding_dim, attention_embedding_dim // 4, replace=False
+        )
+        random_index.append(indice)
+    """
+    new_rep = torch.concat(
+        [rep[:, :, rand_index] for rand_index in random_index],
+        dim=1,
+    )
+    if not add_const:
+        return new_rep
+    const = torch.ones((rep.size(0), 1, len(random_index[0]))).to(rep.device)
+    new_rep = torch.cat([new_rep, const], dim=1)
+    return new_rep
 
 
 class SwinUNETR(nn.Module):
@@ -65,6 +99,9 @@ class SwinUNETR(nn.Module):
         use_checkpoint: bool = False,
         spatial_dims: int = 3,
         downsample="merging",
+        cross_attention_dim=128,
+        cross_attention_index=[5],
+        predict_shape_rep=False,
     ) -> None:
         """
         Args:
@@ -142,7 +179,28 @@ class SwinUNETR(nn.Module):
             use_checkpoint=use_checkpoint,
             spatial_dims=spatial_dims,
             downsample=look_up_option(downsample, MERGING_MODE) if isinstance(downsample, str) else downsample,
+            # cross_attention_dim=cross_attention_dim // 8 * 2,
+            cross_attention_dim=64,
+            cross_attention_index=cross_attention_index,
         )
+        self.cross_attention_index = cross_attention_index
+        if cross_attention_index != [5]:
+            self.shape_rep_proj = nn.Linear(
+                cross_attention_dim,
+                # 8 // factor * (input_size // 2 ** (len(channel_nums) - 1)) ** 2,
+                8 * 16**2,  # seq len 256 for shape rep
+            )
+
+            self.shape_rep_conv = nn.Sequential(
+                nn.Conv2d(8, 16, 3),
+                nn.BatchNorm2d(16),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(16, 32, 7),
+                nn.BatchNorm2d(32),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(32, 64, 7),
+                nn.LeakyReLU(inplace=True),
+            )
 
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
@@ -193,6 +251,14 @@ class SwinUNETR(nn.Module):
             norm_name=norm_name,
             res_block=True,
         )
+        self.predict_shape_rep = predict_shape_rep
+        if self.predict_shape_rep:
+            self.shape_conv = nn.Sequential(
+                nn.Conv2d(16 * feature_size, 64, 3, 1, 1),
+                nn.LeakyReLU(inplace=True),
+                nn.Conv2d(64, 16, 3, 1, 1),
+            )
+            self.shape_fc = nn.Linear(16 * img_size[0] // 32 * img_size[1] // 32, cross_attention_dim)
 
         self.decoder5 = UnetrUpBlock(
             spatial_dims=spatial_dims,
@@ -243,7 +309,11 @@ class SwinUNETR(nn.Module):
             res_block=True,
         )
 
-        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
+        self.out = UnetOutBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size,
+            out_channels=out_channels,
+        )
 
     def load_from(self, weights):
         with torch.no_grad():
@@ -294,20 +364,36 @@ class SwinUNETR(nn.Module):
                 weights["state_dict"]["module.layers4.0.downsample.norm.bias"]
             )
 
-    def forward(self, x_in):
-        hidden_states_out = self.swinViT(x_in, self.normalize)
+    def forward(self, x_in, context=None):
+        if context is not None and self.cross_attention_index != [5]:
+            # context = seq_rep_converter(context)
+            context = context.view(context.size(0), -1)
+            cu = self.shape_rep_proj(context)
+            cu = cu.view(cu.size(0), 8, 16, 16)
+            cu = self.shape_rep_conv(cu)
+            context = rearrange(cu, "n c h w -> n (h w) c")
+
+        hidden_states_out = self.swinViT(x_in, context=context)
         enc0 = self.encoder1(x_in)
         enc1 = self.encoder2(hidden_states_out[0])
         enc2 = self.encoder3(hidden_states_out[1])
         enc3 = self.encoder4(hidden_states_out[2])
         dec4 = self.encoder10(hidden_states_out[4])
+        if self.predict_shape_rep:
+            pred_shape_rep = self.shape_conv(dec4)
+            pred_shape_rep = pred_shape_rep.view(pred_shape_rep.shape[0], -1)
+            pred_shape_rep = self.shape_fc(pred_shape_rep)
+            pred_shape_rep = pred_shape_rep.unsqueeze(1)
+        else:
+            pred_shape_rep = None
         dec3 = self.decoder5(dec4, hidden_states_out[3])
         dec2 = self.decoder4(dec3, enc3)
         dec1 = self.decoder3(dec2, enc2)
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
         logits = self.out(out)
-        return logits
+        output_dict = {"shape_rep": pred_shape_rep, "seg_map": logits}
+        return output_dict
 
 
 def window_partition(x, window_size):
@@ -338,7 +424,14 @@ def window_partition(x, window_size):
         )
     elif len(x_shape) == 4:
         b, h, w, c = x.shape
-        x = x.view(b, h // window_size[0], window_size[0], w // window_size[1], window_size[1], c)
+        x = x.view(
+            b,
+            h // window_size[0],
+            window_size[0],
+            w // window_size[1],
+            window_size[1],
+            c,
+        )
         windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size[0] * window_size[1], c)
     return windows
 
@@ -370,7 +463,14 @@ def window_reverse(windows, window_size, dims):
 
     elif len(dims) == 3:
         b, h, w = dims
-        x = windows.view(b, h // window_size[0], w // window_size[1], window_size[0], window_size[1], -1)
+        x = windows.view(
+            b,
+            h // window_size[0],
+            w // window_size[1],
+            window_size[0],
+            window_size[1],
+            -1,
+        )
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, -1)
     return x
 
@@ -570,7 +670,13 @@ class SwinTransformerBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(hidden_size=dim, mlp_dim=mlp_hidden_dim, act=act_layer, dropout_rate=drop, dropout_mode="swin")
+        self.mlp = Mlp(
+            hidden_size=dim,
+            mlp_dim=mlp_hidden_dim,
+            act=act_layer,
+            dropout_rate=drop,
+            dropout_mode="swin",
+        )
 
     def forward_part1(self, x, mask_matrix):
         x_shape = x.size()
@@ -598,7 +704,11 @@ class SwinTransformerBlock(nn.Module):
 
         if any(i > 0 for i in shift_size):
             if len(x_shape) == 5:
-                shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
+                shifted_x = torch.roll(
+                    x,
+                    shifts=(-shift_size[0], -shift_size[1], -shift_size[2]),
+                    dims=(1, 2, 3),
+                )
             elif len(x_shape) == 4:
                 shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1]), dims=(1, 2))
             attn_mask = mask_matrix
@@ -611,7 +721,11 @@ class SwinTransformerBlock(nn.Module):
         shifted_x = window_reverse(attn_windows, window_size, dims)
         if any(i > 0 for i in shift_size):
             if len(x_shape) == 5:
-                x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
+                x = torch.roll(
+                    shifted_x,
+                    shifts=(shift_size[0], shift_size[1], shift_size[2]),
+                    dims=(1, 2, 3),
+                )
             elif len(x_shape) == 4:
                 x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1]), dims=(1, 2))
         else:
@@ -685,7 +799,12 @@ class PatchMergingV2(nn.Module):
     https://github.com/microsoft/Swin-Transformer
     """
 
-    def __init__(self, dim: int, norm_layer: type[LayerNorm] = nn.LayerNorm, spatial_dims: int = 3) -> None:
+    def __init__(
+        self,
+        dim: int,
+        norm_layer: type[LayerNorm] = nn.LayerNorm,
+        spatial_dims: int = 3,
+    ) -> None:
         """
         Args:
             dim: number of feature channels.
@@ -710,7 +829,8 @@ class PatchMergingV2(nn.Module):
             if pad_input:
                 x = F.pad(x, (0, 0, 0, w % 2, 0, h % 2, 0, d % 2))
             x = torch.cat(
-                [x[:, i::2, j::2, k::2, :] for i, j, k in itertools.product(range(2), range(2), range(2))], -1
+                [x[:, i::2, j::2, k::2, :] for i, j, k in itertools.product(range(2), range(2), range(2))],
+                -1,
             )
 
         elif len(x_shape) == 4:
@@ -718,7 +838,10 @@ class PatchMergingV2(nn.Module):
             pad_input = (h % 2 == 1) or (w % 2 == 1)
             if pad_input:
                 x = F.pad(x, (0, 0, 0, w % 2, 0, h % 2))
-            x = torch.cat([x[:, j::2, i::2, :] for i, j in itertools.product(range(2), range(2))], -1)
+            x = torch.cat(
+                [x[:, j::2, i::2, :] for i, j in itertools.product(range(2), range(2))],
+                -1,
+            )
 
         x = self.norm(x)
         x = self.reduction(x)
@@ -773,17 +896,37 @@ def compute_mask(dims, window_size, shift_size, device):
     if len(dims) == 3:
         d, h, w = dims
         img_mask = torch.zeros((1, d, h, w, 1), device=device)
-        for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
-            for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
-                for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2], None):
+        for d in (
+            slice(-window_size[0]),
+            slice(-window_size[0], -shift_size[0]),
+            slice(-shift_size[0], None),
+        ):
+            for h in (
+                slice(-window_size[1]),
+                slice(-window_size[1], -shift_size[1]),
+                slice(-shift_size[1], None),
+            ):
+                for w in (
+                    slice(-window_size[2]),
+                    slice(-window_size[2], -shift_size[2]),
+                    slice(-shift_size[2], None),
+                ):
                     img_mask[:, d, h, w, :] = cnt
                     cnt += 1
 
     elif len(dims) == 2:
         h, w = dims
         img_mask = torch.zeros((1, h, w, 1), device=device)
-        for h in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
-            for w in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
+        for h in (
+            slice(-window_size[0]),
+            slice(-window_size[0], -shift_size[0]),
+            slice(-shift_size[0], None),
+        ):
+            for w in (
+                slice(-window_size[1]),
+                slice(-window_size[1], -shift_size[1]),
+                slice(-shift_size[1], None),
+            ):
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
@@ -817,6 +960,8 @@ class BasicLayer(nn.Module):
         norm_layer: type[LayerNorm] = nn.LayerNorm,
         downsample: nn.Module | None = None,
         use_checkpoint: bool = False,
+        cross_attention_dim=32,
+        use_cross_attention=False,
     ) -> None:
         """
         Args:
@@ -840,13 +985,42 @@ class BasicLayer(nn.Module):
         self.no_shift = tuple(0 for i in window_size)
         self.depth = depth
         self.use_checkpoint = use_checkpoint
-        self.blocks = nn.ModuleList(
-            [
+        self.use_cross_attention = use_cross_attention
+        if not use_cross_attention:
+            self.blocks = nn.ModuleList(
+                [
+                    SwinTransformerBlock(
+                        dim=dim,
+                        num_heads=num_heads,
+                        window_size=self.window_size,
+                        shift_size=self.no_shift if (i % 2 == 0) else self.shift_size,
+                        mlp_ratio=mlp_ratio,
+                        qkv_bias=qkv_bias,
+                        drop=drop,
+                        attn_drop=attn_drop,
+                        drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                        norm_layer=norm_layer,
+                        use_checkpoint=use_checkpoint,
+                    )
+                    for i in range(depth)
+                ]
+            )
+        else:
+            blocks = [
+                TransformerBlock(
+                    hidden_size=dim,
+                    mlp_dim=int(dim * mlp_ratio),
+                    num_heads=num_heads,
+                    dropout_rate=drop,
+                    qkv_bias=qkv_bias,
+                    cross_attention_dim=cross_attention_dim,
+                )
+            ] + [
                 SwinTransformerBlock(
                     dim=dim,
                     num_heads=num_heads,
                     window_size=self.window_size,
-                    shift_size=self.no_shift if (i % 2 == 0) else self.shift_size,
+                    shift_size=self.no_shift if ((i + 1) % 2 == 0) else self.shift_size,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
                     drop=drop,
@@ -855,14 +1029,14 @@ class BasicLayer(nn.Module):
                     norm_layer=norm_layer,
                     use_checkpoint=use_checkpoint,
                 )
-                for i in range(depth)
+                for i in range(depth - 1)
             ]
-        )
+            self.blocks = nn.ModuleList(blocks)
         self.downsample = downsample
         if callable(self.downsample):
             self.downsample = downsample(dim=dim, norm_layer=norm_layer, spatial_dims=len(self.window_size))
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         x_shape = x.size()
         if len(x_shape) == 5:
             b, c, d, h, w = x_shape
@@ -886,8 +1060,15 @@ class BasicLayer(nn.Module):
             hp = int(np.ceil(h / window_size[0])) * window_size[0]
             wp = int(np.ceil(w / window_size[1])) * window_size[1]
             attn_mask = compute_mask([hp, wp], window_size, shift_size, x.device)
-            for blk in self.blocks:
-                x = blk(x, attn_mask)
+            if self.use_cross_attention:
+                x = x.reshape(b, h * w, c)
+                x = self.blocks[0](x, context)
+                x = x.reshape(b, h, w, c)
+                for blk in self.blocks[1:]:
+                    x = blk(x, attn_mask)
+            else:
+                for blk in self.blocks:
+                    x = blk(x, attn_mask)
             x = x.view(b, h, w, -1)
             if self.downsample is not None:
                 x = self.downsample(x)
@@ -921,6 +1102,8 @@ class SwinTransformer(nn.Module):
         use_checkpoint: bool = False,
         spatial_dims: int = 3,
         downsample="merging",
+        cross_attention_dim=32,
+        cross_attention_index=[5],
     ) -> None:
         """
         Args:
@@ -978,6 +1161,8 @@ class SwinTransformer(nn.Module):
                 norm_layer=norm_layer,
                 downsample=down_sample_mod,
                 use_checkpoint=use_checkpoint,
+                cross_attention_dim=cross_attention_dim,
+                use_cross_attention=i_layer in cross_attention_index,
             )
             if i_layer == 0:
                 self.layers1.append(layer)
@@ -1004,16 +1189,16 @@ class SwinTransformer(nn.Module):
                 x = rearrange(x, "n h w c -> n c h w")
         return x
 
-    def forward(self, x, normalize=True):
+    def forward(self, x, normalize=True, context=None):
         x0 = self.patch_embed(x)
         x0 = self.pos_drop(x0)
         x0_out = self.proj_out(x0, normalize)
-        x1 = self.layers1[0](x0.contiguous())
+        x1 = self.layers1[0](x0.contiguous(), context=context)
         x1_out = self.proj_out(x1, normalize)
-        x2 = self.layers2[0](x1.contiguous())
+        x2 = self.layers2[0](x1.contiguous(), context=context)
         x2_out = self.proj_out(x2, normalize)
-        x3 = self.layers3[0](x2.contiguous())
+        x3 = self.layers3[0](x2.contiguous(), context=context)
         x3_out = self.proj_out(x3, normalize)
-        x4 = self.layers4[0](x3.contiguous())
+        x4 = self.layers4[0](x3.contiguous(), context=context)
         x4_out = self.proj_out(x4, normalize)
         return [x0_out, x1_out, x2_out, x3_out, x4_out]

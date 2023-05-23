@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch.nn as nn
 
 from monai.networks.blocks.mlp import MLPBlock
-from monai.networks.blocks.selfattention import SABlock
+from monai.networks.blocks.selfattention import SABlock, CABlock
 
 
 class TransformerBlock(nn.Module):
@@ -24,7 +24,13 @@ class TransformerBlock(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, mlp_dim: int, num_heads: int, dropout_rate: float = 0.0, qkv_bias: bool = False
+        self,
+        hidden_size: int,
+        mlp_dim: int,
+        num_heads: int,
+        dropout_rate: float = 0.0,
+        qkv_bias: bool = False,
+        cross_attention_dim=None,
     ) -> None:
         """
         Args:
@@ -43,13 +49,23 @@ class TransformerBlock(nn.Module):
 
         if hidden_size % num_heads != 0:
             raise ValueError("hidden_size should be divisible by num_heads.")
-
         self.mlp = MLPBlock(hidden_size, mlp_dim, dropout_rate)
         self.norm1 = nn.LayerNorm(hidden_size)
-        self.attn = SABlock(hidden_size, num_heads, dropout_rate, qkv_bias)
+        self.attn = (
+            SABlock(hidden_size, num_heads, dropout_rate, qkv_bias)
+            if not cross_attention_dim
+            else CABlock(
+                query_dim=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_heads,
+                dim_head=hidden_size // num_heads,
+                dropout=dropout_rate,
+                bias=qkv_bias,
+            )
+        )
         self.norm2 = nn.LayerNorm(hidden_size)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, context=None):
+        x = x + self.attn(self.norm1(x), context=context)
         x = x + self.mlp(self.norm2(x))
         return x
