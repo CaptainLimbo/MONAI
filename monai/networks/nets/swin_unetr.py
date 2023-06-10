@@ -179,28 +179,28 @@ class SwinUNETR(nn.Module):
             use_checkpoint=use_checkpoint,
             spatial_dims=spatial_dims,
             downsample=look_up_option(downsample, MERGING_MODE) if isinstance(downsample, str) else downsample,
-            # cross_attention_dim=cross_attention_dim // 8 * 2,
-            cross_attention_dim=64,
+            cross_attention_dim=cross_attention_dim // 8 * 2,
+            # cross_attention_dim=64,
             cross_attention_index=cross_attention_index,
         )
         self.cross_attention_index = cross_attention_index
-        if cross_attention_index != [5]:
-            self.shape_rep_proj = nn.Linear(
-                cross_attention_dim,
-                # 8 // factor * (input_size // 2 ** (len(channel_nums) - 1)) ** 2,
-                8 * 16**2,  # seq len 256 for shape rep
-            )
+        # if cross_attention_index != [5]:
+        #     self.shape_rep_proj = nn.Linear(
+        #         cross_attention_dim,
+        #         # 8 // factor * (input_size // 2 ** (len(channel_nums) - 1)) ** 2,
+        #         8 * 16**2,  # seq len 256 for shape rep
+        #     )
 
-            self.shape_rep_conv = nn.Sequential(
-                nn.Conv2d(8, 16, 3),
-                nn.BatchNorm2d(16),
-                nn.LeakyReLU(inplace=True),
-                nn.Conv2d(16, 32, 7),
-                nn.BatchNorm2d(32),
-                nn.LeakyReLU(inplace=True),
-                nn.Conv2d(32, 64, 7),
-                nn.LeakyReLU(inplace=True),
-            )
+        #     self.shape_rep_conv = nn.Sequential(
+        #         nn.Conv2d(8, 16, 3),
+        #         nn.BatchNorm2d(16),
+        #         nn.LeakyReLU(inplace=True),
+        #         nn.Conv2d(16, 32, 7),
+        #         nn.BatchNorm2d(32),
+        #         nn.LeakyReLU(inplace=True),
+        #         nn.Conv2d(32, 64, 7),
+        #         nn.LeakyReLU(inplace=True),
+        #     )
 
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
@@ -366,12 +366,12 @@ class SwinUNETR(nn.Module):
 
     def forward(self, x_in, context=None):
         if context is not None and self.cross_attention_index != [5]:
-            # context = seq_rep_converter(context)
-            context = context.view(context.size(0), -1)
-            cu = self.shape_rep_proj(context)
-            cu = cu.view(cu.size(0), 8, 16, 16)
-            cu = self.shape_rep_conv(cu)
-            context = rearrange(cu, "n c h w -> n (h w) c")
+            context = seq_rep_converter(context)
+            # context = context.view(context.size(0), -1)
+            # cu = self.shape_rep_proj(context)
+            # cu = cu.view(cu.size(0), 8, 16, 16)
+            # cu = self.shape_rep_conv(cu)
+            # context = rearrange(cu, "n c h w -> n (h w) c")
 
         hidden_states_out = self.swinViT(x_in, context=context)
         enc0 = self.encoder1(x_in)
